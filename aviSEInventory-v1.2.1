@@ -1,0 +1,240 @@
+import os
+import requests
+import time
+import csv
+import json
+import sys
+from datetime import datetime
+from multiprocessing import Pool
+import urllib3
+
+# Disable SSL certificate warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Global variable to control logging level
+DEBUG_MODE = False
+
+# User-defined variables
+default_avi_user = "admin"
+default_avi_pass = "VMware1!VMware1!"
+
+# Define controllers and specific credentials
+controllers = [
+    "m00avientlb.corp.ad.sbi",
+    "h00avientlb.corp.ad.sbi",
+    "h00aviblb01.corp.ad.sbi",
+    "m00aviblb.corp.ad.sbi",
+    "m00avientuat.corp.ad.sbi",
+    "m05avientlb.corp.ad.sbi",
+    "m05avient.corp.ad.sbi",
+    "h05avientlb.corp.ad.sbi",
+    "h05avient.corp.ad.sbi",
+    "h06avient.corp.ad.sbi",
+]
+
+credentials = {
+    "m00avientuat.corp.ad.sbi": ("admin", "VMware1!"),
+    "h06avient.corp.ad.sbi": ("admin", "VMw@re1@3")
+}
+
+metrics_list = "se_if.avg_bandwidth,se_if.max_peak_bandwidth,se_stats.avg_cpu_usage,se_stats.avg_disk1_usage,se_stats.avg_mem_usage,se_stats.avg_connection_mem_usage"
+avi_version = "22.1.5"
+api_step = 21600
+api_limit = 1
+enable_parallel_processing = True
+parallel_processes = 20
+
+# Internal variables
+default_metrics = "se_if.avg_bandwidth,se_stats.avg_cpu_usage,se_stats.avg_disk1_usage,se_stats.avg_mem_usage,se_stats.avg_persistent_table_usage,se_if.avg_rx_bandwidth,se_if.avg_rx_bytes_dropped,se_stats.avg_ssl_session_cache_usage,se_if.avg_tx_pkts,se_if.max_se_bandwidth,se_stats.avg_dynamic_mem_usage"
+metrics = metrics_list if metrics_list else default_metrics
+metrics_string = metrics.replace(",", "%2C")
+metrics_headings = metrics.replace("se_if.", "").replace("se_stats.", "").replace("_", " ")
+
+# Log function with logging levels
+def log(message, level="info"):
+    if level == "debug" and DEBUG_MODE:
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [DEBUG]: {message}")
+    elif level == "info":
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [INFO]: {message}")
+
+# Validate step value
+def validate_step(step_value):
+    log(f"Validating step value: {step_value}", level="debug")
+    if step_value < 300:
+        log("Warning: Step value too low. Setting step to 300.", level="debug")
+        return 300
+    if step_value % 300 != 0:
+        adjusted_step = ((step_value // 300 + 1) * 300)
+        log(f"Warning: Step value is not a multiple of 300. Adjusting to {adjusted_step}.", level="debug")
+        return adjusted_step
+    log(f"Step value validated: {step_value}", level="debug")
+    return step_value
+
+# Convert bps to Mbps
+def convert_to_mbps(bits_per_second):
+    log(f"Converting {bits_per_second} bits per second to Mbps", level="debug")
+    try:
+        result = round(float(bits_per_second) / 1000000, 2)
+        log(f"Conversion result: {result} Mbps", level="debug")
+        return result
+    except (TypeError, ValueError):
+        log(f"Invalid value for conversion: {bits_per_second}", level="debug")
+        return "N/A"
+
+# Retry mechanism
+def retry_request(url, headers, retries=3):
+    log(f"Making request to {url}", level="debug")
+    attempt = 0
+    wait_time = 2
+    while attempt < retries:
+        log(f"Attempt {attempt+1} of {retries}", level="debug")
+        response = requests.get(url, headers=headers, verify=False)
+        if response.status_code == 200:
+            log("Request successful", level="debug")
+            return response
+        attempt += 1
+        log(f"Request failed with status code {response.status_code}. Retry {attempt}/{retries}. Waiting {wait_time}s before retrying...", level="debug")
+        time.sleep(wait_time)
+        wait_time *= 2
+    log(f"Error: Failed to retrieve data after {retries} attempts.", level="info")
+    return None
+
+# Fetch performance metrics for a given SE UUID
+def fetch_performance_metrics(se_info):
+    log(f"Fetching performance metrics for SE: {se_info[1]} (UUID: {se_info[0]})", level="info")
+    se_uuid, se_name, se_ip, se_ip_type, power_state, se_connected, state, reason, version, health_score, csv_file_path, avi_fqdn, sid, csrft = se_info
+    step = validate_step(api_step)
+
+    url = f"https://{avi_fqdn}/api/analytics/metrics/serviceengine/{se_uuid}/?metric_id={metrics_string}&limit={api_limit}&step={step}"
+    headers = {
+        "X-Avi-Tenant": "admin",
+        "X-Avi-Version": avi_version,
+        "X-Csrftoken": csrft,
+        "Cookie": f"avi-sessionid={sid}; csrftoken={csrft}"
+    }
+    response = retry_request(url, headers)
+
+    if response is None or not response.text:
+        log(f"Error: Failed to retrieve metrics for SE UUID: {se_uuid}", level="info")
+        with open(csv_file_path, 'a', newline='') as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow([avi_fqdn, se_name, se_uuid, se_ip, se_ip_type, power_state, se_connected, state, reason, version, health_score] + ['N/A'] * len(metrics.split(',')))
+        return
+
+    log(f"Parsing performance data for SE: {se_name}", level="debug")
+    perf_data = response.json()
+    metrics_values = []
+    for metric in metrics.split(","):
+        value = next((item['data'][0]['value'] for item in perf_data.get('series', []) if item['header']['name'] == metric), "N/A")
+        if metric in ["se_if.avg_bandwidth", "se_if.max_peak_bandwidth"]:
+            value = convert_to_mbps(value)
+        metrics_values.append(str(value))
+
+    log(f"Writing performance data for SE: {se_name} to CSV", level="debug")
+    with open(csv_file_path, 'a', newline='') as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow([avi_fqdn, se_name, se_uuid, se_ip, se_ip_type, power_state, se_connected, state, reason, version, health_score] + metrics_values)
+
+# Log into the AVI controller
+def avi_login(avi_fqdn):
+    avi_user, avi_pass = credentials.get(avi_fqdn, (default_avi_user, default_avi_pass))
+   
+    log(f"Logging into controller: {avi_fqdn} with user: {avi_user}", level="info")
+    login_url = f"https://{avi_fqdn}/login"
+    response = requests.post(login_url, data={'username': avi_user, 'password': avi_pass}, verify=False)
+    if response.status_code != 200:
+        log(f"Error: Failed to login to controller: {avi_fqdn}", level="info")
+        exit(1)
+
+    cookies = response.cookies
+    sid = cookies.get("avi-sessionid")
+    csrft = cookies.get("csrftoken")
+    if not sid or not csrft:
+        log(f"Error: Failed to retrieve session ID or CSRF token for controller: {avi_fqdn}", level="info")
+        exit(1)
+    log(f"Logged into AVI Controller: {avi_fqdn} (Session ID: {sid})", level="info")
+    return sid, csrft
+
+# Main execution
+def main():
+    global DEBUG_MODE
+    if "--debug" in sys.argv:
+        DEBUG_MODE = True
+        log("Debug mode enabled", level="info")
+   
+    log("Script started.", level="info")
+    log(f"Creating single report file for all controllers", level="debug")
+    #output_dir = f"./{datetime.now().strftime('%Y-%m-%dT%H-%M-%S')}"
+    #os.makedirs(output_dir, exist_ok=True)
+    #csv_file_name = f"{output_dir}/SEInventory-Report-{datetime.now().strftime('%Y-%m-%dT%H-%M-%S')}.csv"
+    csv_file_name = f"/home/imallikarjun/scripts/reports/avi-SEInventory-{datetime.now().strftime('%Y%m%dT%H%M%S')}.csv"
+
+    # Create the CSV file and write the headers once
+    with open(csv_file_name, 'w', newline='') as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["Controller", "SE Name", "SE UUID", "SE Management IPAddress", "IPAddress Type", "Power State", "Connected", "State", "Reason", "Version", "Health Score"] + metrics_headings.split(","))
+
+    for avi_fqdn in controllers:
+        log(f"Processing controller: {avi_fqdn}", level="info")
+        sid, csrft = avi_login(avi_fqdn)
+
+        log(f"Fetching Service Engine inventory from: {avi_fqdn}", level="info")
+        inventory_url = f"https://{avi_fqdn}/api/serviceengine-inventory/"
+        while inventory_url:
+            inventory_response = retry_request(inventory_url, {
+                "X-Avi-Tenant": "admin",
+                "X-Avi-Version": avi_version,
+                "X-Csrftoken": csrft,
+                "Cookie": f"avi-sessionid={sid}; csrftoken={csrft}"
+            })
+
+            if not inventory_response or inventory_response.status_code != 200:
+                log(f"Error: Failed to fetch inventory from {avi_fqdn}", level="info")
+                break
+
+            log(f"Parsing Service Engine inventory data from: {avi_fqdn}", level="debug")
+            se_data = inventory_response.json()
+
+            se_info_list = []
+            for se in se_data.get('results', []):
+                config = se.get('config', {})
+                runtime = se.get('runtime', {})
+                health = se.get('health_score', {})
+
+                se_uuid = config.get('uuid', 'N/A')
+                se_name = config.get('name', 'N/A')
+                mgmt_ip_address = config.get('mgmt_ip_address', {})
+                se_ip = mgmt_ip_address.get('addr', 'N/A')
+                se_ip_type = mgmt_ip_address.get('type', 'N/A')
+                power_state = runtime.get('power_state', 'N/A')
+                se_connected = runtime.get('se_connected', 'N/A')
+                oper_status = runtime.get('oper_status', {})
+                state = oper_status.get('state', 'N/A')
+                reason_list = oper_status.get('reason', [])
+                reason = " ".join(reason_list) if reason_list else 'N/A'
+                version = runtime.get('version', 'N/A')
+                health_score = health.get('health_score', 'N/A')
+
+                se_info = [
+                    se_uuid, se_name, se_ip, se_ip_type, power_state, se_connected,
+                    state, reason, version, health_score, csv_file_name, avi_fqdn, sid, csrft
+                ]
+                se_info_list.append(se_info)
+
+            if enable_parallel_processing:
+                log(f"Parallel processing enabled with {parallel_processes} processes.", level="info")
+                with Pool(parallel_processes) as pool:
+                    pool.map(fetch_performance_metrics, se_info_list)
+            else:
+                log("Parallel processing disabled. Processing sequentially.", level="info")
+                for se_info in se_info_list:
+                    fetch_performance_metrics(se_info)
+
+            # Check for pagination, move to the next page if 'next' URL exists
+            inventory_url = se_data.get('next', None)
+
+    log(f"Report saved to file {csv_file_name}", level="info")
+    log("Script completed.", level="info")
+
+if __name__ == "__main__":
+    main()
