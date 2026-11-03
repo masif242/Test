@@ -1,0 +1,21 @@
+ssh admin@<controller-cluster-ip>
+shell                                  # log in with your Avi admin credentials
+switchto tenant <tenant-name>          # only if the DataScript isn't in the admin tenant
+configure vsdatascriptset ds-ip-ratelimit
+rate_limiters
+name ip_10_in_5s
+count 10
+period 5
+burst_sz 0
+save
+save
+show vsdatascriptset ds-ip-ratelimit
+
+
+local key = "blk_" .. avi.vs.client_ip()
+if avi.vs.table_lookup(key, 0) then
+  avi.http.response(429)                 -- still inside the 60 s block
+elseif avi.vs.ratelimit.exceed("ip_10_in_5s", avi.vs.client_ip()) then
+  avi.vs.table_insert(key, "1", 60)      -- >10 req in 5 s: block for 60 s
+  avi.http.response(429)
+end
