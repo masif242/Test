@@ -1,0 +1,31 @@
+local TEST_IP = "10.30.147.6"
+local ENFORCE = true
+local ALLOWLIST = nil
+local BLOCK_SEC = 60
+local static = {js=1, css=1, png=1, jpg=1, jpeg=1, gif=1, svg=1,
+  webp=1, ico=1, woff=1, woff2=1, ttf=1, eot=1, map=1}
+local ip = avi.vs.client_ip()
+if (TEST_IP == nil or ip == TEST_IP)
+  and not (ALLOWLIST and avi.ipgroup.contains(ALLOWLIST, ip)) then
+  local ext = string.match(avi.http.get_path(), "%.(%w+)$")
+  local rl = "ip_10_in_5s"
+  if ext and static[string.lower(ext)] then
+    rl = "ip_static"
+  end
+  local key = "blk_" .. ip
+  local reason
+  if avi.vs.table_lookup(key, 0) then
+    reason = "inside 60s block"
+  elseif avi.vs.ratelimit.exceed(rl, ip) then
+    avi.vs.table_insert(key, rl, BLOCK_SEC)
+    reason = "exceeded " .. rl
+  end
+  if reason then
+    local mode = "MONITOR "
+    if ENFORCE then mode = "BLOCK " end
+    avi.vs.log("RL " .. mode .. ip .. " " .. reason)
+    if ENFORCE then
+      avi.http.response(429)
+    end
+  end
+end
